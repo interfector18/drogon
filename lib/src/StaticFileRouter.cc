@@ -235,6 +235,17 @@ void StaticFileRouter::route(
             }
         }
     }
+
+    // Default to homepage if not found
+    if (!HttpAppFrameworkImpl::instance().getHomePage().empty())
+    {
+        std::string filePath =
+            HttpAppFrameworkImpl::instance().getDocumentRoot() + "/" +
+            HttpAppFrameworkImpl::instance().getHomePage();
+        sendStaticFileResponse(filePath, req, std::move(callback), "");
+        return;
+    }
+
     defaultHandler_(req, std::move(callback));
 }
 

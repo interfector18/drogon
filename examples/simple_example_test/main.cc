@@ -293,16 +293,8 @@ void doTest(const HttpClientPtr &client,
                                        const HttpResponsePtr &resp) {
                             if (result == ReqResult::Ok)
                             {
-                                if (resp->getStatusCode() == k404NotFound)
-                                {
-                                    outputGood(req, isHttps);
-                                }
-                                else
-                                {
-                                    LOG_DEBUG << resp->getBody();
-                                    LOG_ERROR << "Error!";
-                                    exit(1);
-                                }
+                                // redirected to index, should be okay
+                                outputGood(req, isHttps);
                             }
                             else
                             {

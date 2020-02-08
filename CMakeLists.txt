@@ -14,6 +14,7 @@ endif ()
 
 option(BUILD_CTL "Build drogon_ctl" ${BUILD_PROGRAMS})
 option(BUILD_EXAMPLES "Build examples" ${BUILD_PROGRAMS})
+option(BUILD_TESTING "Build testing" ON)
 option(BUILD_ORM "Build orm" ON)
 option(COZ_PROFILING "Use coz for profiling" OFF)
 option(BUILD_DROGON_SHARED "Build drogon as a shared lib" OFF)
@@ -79,16 +80,10 @@ generate_export_header(${PROJECT_NAME} EXPORT_FILE_NAME ${CMAKE_CURRENT_BINARY_D
 include(cmake/DrogonUtilities.cmake)
 include(CheckIncludeFileCXX)
 
+set(DROGON_CXX_STANDARD 20)
 check_include_file_cxx(any HAS_ANY)
 check_include_file_cxx(string_view HAS_STRING_VIEW)
 check_include_file_cxx(coroutine HAS_COROUTINE)
-if (HAS_ANY AND HAS_STRING_VIEW AND HAS_COROUTINE)
-    set(DROGON_CXX_STANDARD 20)
-elseif (HAS_ANY AND HAS_STRING_VIEW)
-    set(DROGON_CXX_STANDARD 17)
-else ()
-    set(DROGON_CXX_STANDARD 14)
-endif ()
 
 target_include_directories(
     ${PROJECT_NAME}
