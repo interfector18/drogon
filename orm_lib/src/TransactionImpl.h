@@ -34,6 +34,7 @@ class TransactionImpl : public Transaction,
                     TransactionType transType = TransactionType::Deferred);
     ~TransactionImpl() override;
     void rollback() override;
+    void commitSync() noexcept(false) override;
 
     void setCommitCallback(
         const std::function<void(bool)> &commitCallback) override
@@ -135,10 +136,17 @@ class TransactionImpl : public Transaction,
 
     std::function<void()> usedUpCallback_;
     bool isCommitedOrRolledback_{false};
+    bool isCommitOrRollbackRequested_{false};
+    bool isRolledBack_{false};
     bool isWorking_{false};
     void execNewTask();
     void releaseConnection();
     void failBufferedCommands(const std::exception_ptr &ePtr);
+    bool cancelPendingCommit();
+    void finishCommit(const std::exception_ptr &exception);
+    void commitAsyncImpl(
+        std::function<void(const std::exception_ptr &)> &&callback) override;
+    std::function<void(const std::exception_ptr &)> explicitCommitCallback_;
 
     struct SqlCmd
     {
@@ -150,6 +158,7 @@ class TransactionImpl : public Transaction,
         QueryCallback callback_;
         ExceptPtrCallback exceptionCallback_;
         bool isRollbackCmd_{false};
+        bool isCommitCmd_{false};
         std::shared_ptr<TransactionImpl> thisPtr_;
     };
 

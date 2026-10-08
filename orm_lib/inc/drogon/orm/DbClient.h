@@ -97,6 +97,20 @@ struct [[nodiscard]] TransactionAwaiter
     TransactionType transType_;
 };
 
+struct [[nodiscard]] CommitAwaiter : public CallbackAwaiter<void>
+{
+    explicit CommitAwaiter(Transaction *transaction) : transaction_(transaction)
+    {
+    }
+
+    void await_suspend(std::coroutine_handle<> handle);
+
+  private:
+    // Only used inside await_suspend(); the pending commit keeps the
+    // transaction alive until it resumes the coroutine.
+    Transaction *transaction_;
+};
+
 #endif
 
 }  // namespace internal
@@ -444,13 +458,88 @@ class Transaction : public DbClient
 {
   public:
     virtual void rollback() = 0;
-    // virtual void commit() = 0;
+
+    /**
+     * @brief Commit the transaction asynchronously.
+     *
+     * COMMIT is sent after all SQL already submitted to the transaction.
+     * Once a commit is requested, further SQL on the transaction fails with
+     * TransactionRollback.
+     *
+     * @param committedCallback Called once COMMIT has succeeded.
+     * @param exceptionCallback Called with the failure otherwise:
+     * - the database error raised by COMMIT itself (for example a
+     *   SerializationFailure or a deferred constraint violation);
+     * - TransactionRollback when the transaction was rolled back before
+     *   COMMIT was sent, e.g. because an earlier statement failed;
+     * - UsageError when a commit was already requested.
+     *
+     * Callbacks registered with setCommitCallback() are still invoked.
+     */
+    void commitAsync(std::function<void()> committedCallback,
+                     std::function<void(const DrogonDbException &)>
+                         exceptionCallback)
+    {
+        commitAsyncImpl([committedCallback = std::move(committedCallback),
+                         exceptionCallback = std::move(exceptionCallback)](
+                            const std::exception_ptr &exception) {
+            if (!exception)
+            {
+                if (committedCallback)
+                    committedCallback();
+                return;
+            }
+            try
+            {
+                std::rethrow_exception(exception);
+            }
+            catch (const DrogonDbException &e)
+            {
+                if (exceptionCallback)
+                    exceptionCallback(e);
+            }
+        });
+    }
+
+    /**
+     * @brief Commit the transaction and block until it completes.
+     *
+     * @throws DrogonDbException with the same failures as commitAsync().
+     * Calling it from the transaction's own event loop thread would never
+     * return, so that throws UsageError instead.
+     */
+    virtual void commitSync() noexcept(false) = 0;
+
+#ifdef __cpp_impl_coroutine
+    /**
+     * @brief Commit the transaction in a coroutine.
+     *
+     * @return An awaitable that completes once COMMIT has succeeded and
+     * throws the failures described for commitAsync() otherwise.
+     */
+    internal::CommitAwaiter commitCoro()
+    {
+        return internal::CommitAwaiter(this);
+    }
+#endif
+
     virtual void setCommitCallback(
         const std::function<void(bool)> &commitCallback) = 0;
 
     void closeAll() override
     {
     }
+
+  protected:
+#ifdef __cpp_impl_coroutine
+    friend struct internal::CommitAwaiter;
+#endif
+    /**
+     * @brief Request COMMIT; the callback receives nullptr on success and
+     * the failure otherwise.
+     */
+    virtual void commitAsyncImpl(
+        std::function<void(const std::exception_ptr &)> &&callback) = 0;
 };
 
 #ifdef __cpp_impl_coroutine
@@ -468,6 +557,18 @@ inline void internal::TransactionAwaiter::await_suspend(
             handle.resume();
         },
         transType_);
+}
+
+inline void internal::CommitAwaiter::await_suspend(
+    std::coroutine_handle<> handle)
+{
+    assert(transaction_ != nullptr);
+    transaction_->commitAsyncImpl(
+        [this, handle](const std::exception_ptr &exception) {
+            if (exception)
+                setException(exception);
+            handle.resume();
+        });
 }
 #endif
 
