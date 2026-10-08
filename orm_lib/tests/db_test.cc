@@ -1196,6 +1196,23 @@ DROGON_TEST(PostgreTest)
                 "what():",
                 e.base().what());
         }
+        try
+        {
+            auto trans = co_await clientPtr->newTransactionCoro();
+            auto result =
+                co_await trans->execSqlCoro("select * from users where 1=$1;",
+                                            1);
+            MANDATE(result.size() != 0);
+            MANDATE(co_await trans->commitCoro());
+            MANDATE(!(co_await trans->commitCoro()));
+        }
+        catch (const DrogonDbException &e)
+        {
+            FAULT(
+                "postgresql - DbClient coroutine transaction interface(1) "
+                "what():",
+                e.base().what());
+        }
     };
     drogon::sync_wait(coro_test());
 
@@ -2489,6 +2506,22 @@ DROGON_TEST(MySQLTest)
         catch (const DrogonDbException &e)
         {
             FAULT("mysql - DbClient coroutine interface(1) what():",
+                  e.base().what());
+        }
+        /// 7.3 Transactions
+        try
+        {
+            auto trans = co_await clientPtr->newTransactionCoro();
+            auto result =
+                co_await trans->execSqlCoro("select * from users where 1=?;",
+                                            1);
+            MANDATE(result.size() != 0);
+            MANDATE(co_await trans->commitCoro());
+            MANDATE(!(co_await trans->commitCoro()));
+        }
+        catch (const DrogonDbException &e)
+        {
+            FAULT("mysql - DbClient coroutine transaction interface what():",
                   e.base().what());
         }
     };
@@ -4290,6 +4323,38 @@ DROGON_TEST(SQLite3FailedCommitRollbackTest)
         client->execSqlSync("DELETE FROM children");
         client->execSqlSync("DELETE FROM parents");
     }
+
+    // An explicit commit that fails must also roll back before the connection
+    // is reused.
+    {
+        auto legacyCommitted = std::make_shared<std::promise<bool>>();
+        auto legacyCommitResult = legacyCommitted->get_future();
+        auto trans = client->newTransaction([legacyCommitted](bool success) {
+            legacyCommitted->set_value(success);
+        });
+        trans->execSqlSync("INSERT INTO parents VALUES(1)");
+        trans->execSqlSync("INSERT INTO children VALUES(2)");
+        auto queuedRead = client->execSqlAsyncFuture(
+            "SELECT (SELECT count(*) FROM parents),"
+            " (SELECT count(*) FROM children)");
+        CHECK(!trans->commit());
+        REQUIRE(legacyCommitResult.wait_for(5s) == std::future_status::ready);
+        CHECK(!legacyCommitResult.get());
+        REQUIRE(queuedRead.wait_for(5s) == std::future_status::ready);
+        auto rows = queuedRead.get();
+        REQUIRE(rows[0][0].as<int>() == 0);
+        REQUIRE(rows[0][1].as<int>() == 0);
+
+        trans = client->newTransaction();
+        trans->execSqlSync("INSERT INTO parents VALUES(2)");
+        trans->execSqlSync("INSERT INTO children VALUES(2)");
+        CHECK(trans->commit());
+        rows = client->execSqlSync("SELECT parent_id FROM children");
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0][0].as<int>() == 2);
+        client->execSqlSync("DELETE FROM children");
+        client->execSqlSync("DELETE FROM parents");
+    }
 }
 
 DROGON_TEST(SQLite3TransactionTypeTest)
@@ -4395,6 +4460,136 @@ DROGON_TEST(SQLite3TransactionTypeTest)
         MANDATE(r.size() == 0);
         SUCCESS();
     }
+
+    // --- Explicit synchronous commit ---
+    {
+        try
+        {
+            auto trans = clientPtr->newTransaction();
+            trans->execSqlSync(
+                "INSERT INTO trans_type_test(id, val) VALUES(4, 40)");
+            MANDATE(trans->commit());
+            MANDATE(!trans->commit());
+            try
+            {
+                trans->execSqlSync(
+                    "INSERT INTO trans_type_test(id, val) VALUES(7, 70)");
+                FAULT("sqlite3 - SQL after explicit commit was accepted");
+            }
+            catch (const TransactionRollback &)
+            {
+                SUCCESS();
+            }
+        }
+        catch (const DrogonDbException &e)
+        {
+            FAULT("sqlite3 - explicit commit what():", e.base().what());
+            return;
+        }
+        auto r = clientPtr->execSqlSync(
+            "SELECT val FROM trans_type_test WHERE id=4");
+        MANDATE(r.size() == 1);
+        MANDATE(r[0][0].as<int>() == 40);
+        SUCCESS();
+    }
+
+    // --- Explicit asynchronous commit ---
+    {
+        std::promise<bool> inserted;
+        auto insertedFuture = inserted.get_future();
+        std::promise<bool> committed;
+        auto committedFuture = committed.get_future();
+        auto trans = clientPtr->newTransaction();
+        trans->execSqlAsync(
+            "INSERT INTO trans_type_test(id, val) VALUES(5, 50)",
+            [&inserted](const Result &) { inserted.set_value(true); },
+            [&inserted](const DrogonDbException &) {
+                inserted.set_value(false);
+            });
+        trans->commitAsync(
+            [&committed](bool result) { committed.set_value(result); });
+        MANDATE(insertedFuture.get());
+        MANDATE(committedFuture.get());
+
+        auto r = clientPtr->execSqlSync(
+            "SELECT val FROM trans_type_test WHERE id=5");
+        MANDATE(r.size() == 1);
+        MANDATE(r[0][0].as<int>() == 50);
+        SUCCESS();
+    }
+
+    // --- A failed queued statement cancels a pending explicit commit ---
+    {
+        std::promise<bool> inserted;
+        auto insertedFuture = inserted.get_future();
+        std::promise<bool> committed;
+        auto committedFuture = committed.get_future();
+        auto trans = clientPtr->newTransaction();
+        trans->execSqlAsync(
+            "INSERT INTO trans_type_test(id, val) VALUES(1, 999)",
+            [&inserted](const Result &) { inserted.set_value(true); },
+            [&inserted](const DrogonDbException &) {
+                inserted.set_value(false);
+            });
+        trans->commitAsync(
+            [&committed](bool result) { committed.set_value(result); });
+        MANDATE(!insertedFuture.get());
+        MANDATE(!committedFuture.get());
+
+        auto r = clientPtr->execSqlSync(
+            "SELECT val FROM trans_type_test WHERE id=1");
+        MANDATE(r.size() == 1);
+        MANDATE(r[0][0].as<int>() == 10);
+        SUCCESS();
+    }
+
+    // --- A rollback cancels a commit that has not been sent ---
+    {
+        std::promise<bool> inserted;
+        auto insertedFuture = inserted.get_future();
+        std::promise<bool> committed;
+        auto committedFuture = committed.get_future();
+        auto trans = clientPtr->newTransaction();
+        // The transaction is still busy inside the result callback, so the
+        // commit is buffered when the rollback is requested.
+        trans->execSqlAsync(
+            "INSERT INTO trans_type_test(id, val) VALUES(8, 80)",
+            [&inserted, &committed, transPtr = trans.get()](const Result &) {
+                transPtr->commitAsync(
+                    [&committed](bool result) { committed.set_value(result); });
+                transPtr->rollback();
+                inserted.set_value(true);
+            },
+            [&inserted](const DrogonDbException &) {
+                inserted.set_value(false);
+            });
+        MANDATE(insertedFuture.get());
+        MANDATE(!committedFuture.get());
+
+        auto r = clientPtr->execSqlSync(
+            "SELECT val FROM trans_type_test WHERE id=8");
+        MANDATE(r.size() == 0);
+        SUCCESS();
+    }
+
+#ifdef __cpp_impl_coroutine
+    // --- Explicit coroutine commit ---
+    {
+        auto trans = clientPtr->newTransaction();
+        trans->execSqlSync(
+            "INSERT INTO trans_type_test(id, val) VALUES(6, 60)");
+        auto commitTask = [trans]() -> drogon::Task<bool> {
+            co_return co_await trans->commitCoro();
+        };
+        MANDATE(drogon::sync_wait(commitTask()));
+
+        auto r = clientPtr->execSqlSync(
+            "SELECT val FROM trans_type_test WHERE id=6");
+        MANDATE(r.size() == 1);
+        MANDATE(r[0][0].as<int>() == 60);
+        SUCCESS();
+    }
+#endif
 }
 
 // Verify the locking mode is actually used by testing observable SQLite

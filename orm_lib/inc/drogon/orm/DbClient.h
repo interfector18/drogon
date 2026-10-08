@@ -97,6 +97,18 @@ struct [[nodiscard]] TransactionAwaiter
     TransactionType transType_;
 };
 
+struct [[nodiscard]] CommitAwaiter : public CallbackAwaiter<bool>
+{
+    explicit CommitAwaiter(Transaction *transaction) : transaction_(transaction)
+    {
+    }
+
+    void await_suspend(std::coroutine_handle<> handle);
+
+  private:
+    Transaction *transaction_;
+};
+
 #endif
 
 }  // namespace internal
@@ -435,7 +447,46 @@ class Transaction : public DbClient
 {
   public:
     virtual void rollback() = 0;
-    // virtual void commit() = 0;
+
+    /**
+     * @brief Commit the transaction and wait for the result.
+     *
+     * The commit is executed after all SQL already submitted to the
+     * transaction. Once a commit is requested, further SQL is rejected.
+     *
+     * @note This method blocks the calling thread. Do not call it from the
+     * event loop thread of the transaction, or it will never return.
+     *
+     * @return true when the commit command succeeds, otherwise false.
+     */
+    virtual bool commit() = 0;
+
+    /**
+     * @brief Commit the transaction asynchronously.
+     *
+     * The commit is executed after all SQL already submitted to the
+     * transaction. Once a commit is requested, further SQL is rejected.
+     *
+     * @param callback Invoked with true when the commit command succeeds and
+     * false otherwise, including when the transaction is rolled back before
+     * the commit is sent.
+     */
+    virtual void commitAsync(const std::function<void(bool)> &callback =
+                                 std::function<void(bool)>()) = 0;
+
+#ifdef __cpp_impl_coroutine
+    /**
+     * @brief Commit the transaction in a coroutine.
+     *
+     * @return An awaitable that resumes with true when the commit command
+     * succeeds and false otherwise. See commitAsync() for details.
+     */
+    internal::CommitAwaiter commitCoro()
+    {
+        return internal::CommitAwaiter(this);
+    }
+#endif
+
     virtual void setCommitCallback(
         const std::function<void(bool)> &commitCallback) = 0;
 
@@ -459,6 +510,16 @@ inline void internal::TransactionAwaiter::await_suspend(
             handle.resume();
         },
         transType_);
+}
+
+inline void internal::CommitAwaiter::await_suspend(
+    std::coroutine_handle<> handle)
+{
+    assert(transaction_ != nullptr);
+    transaction_->commitAsync([this, handle](bool committed) {
+        setValue(committed);
+        handle.resume();
+    });
 }
 #endif
 
