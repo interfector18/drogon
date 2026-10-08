@@ -91,7 +91,7 @@ TransactionImpl::~TransactionImpl()
 {
     LOG_TRACE << "Destruct";
     assert(sqlCmdBuffer_.empty());
-    if (!isCommitedOrRolledback_)
+    if (!isCommitOrRollbackRequested_ && !isCommitedOrRolledback_)
     {
         auto loop = connectionPtr_->loop();
         loop->queueInLoop([conn = connectionPtr_,
@@ -158,7 +158,7 @@ void TransactionImpl::execSqlInLoop(
     std::function<void(const std::exception_ptr &)> &&exceptCallback)
 {
     loop_->assertInLoopThread();
-    if (!isCommitedOrRolledback_)
+    if (!isCommitOrRollbackRequested_ && !isCommitedOrRolledback_)
     {
         if (timeout_ > 0.0)
         {
@@ -206,9 +206,8 @@ void TransactionImpl::execSqlInLoop(
     }
     else
     {
-        // The transaction has been rolled back;
-        auto exceptPtr = std::make_exception_ptr(
-            TransactionRollback("The transaction has been rolled back"));
+        auto exceptPtr = std::make_exception_ptr(TransactionRollback(
+            "The transaction has already been committed or rolled back"));
         exceptCallback(exceptPtr);
     }
 }
@@ -220,6 +219,17 @@ void TransactionImpl::rollback()
     loop_->runInLoop([thisPtr]() {
         if (thisPtr->isCommitedOrRolledback_)
             return;
+        if (thisPtr->isCommitOrRollbackRequested_)
+        {
+            // A rollback may only overtake a commit that has not been sent
+            if (!thisPtr->cancelPendingCommit())
+                return;
+        }
+        else
+        {
+            thisPtr->isCommitOrRollbackRequested_ = true;
+            thisPtr->isRolledBack_ = true;
+        }
         if (thisPtr->isWorking_)
         {
             // push sql cmd to buffer;
@@ -262,6 +272,126 @@ void TransactionImpl::rollback()
     });
 }
 
+void TransactionImpl::commitSync()
+{
+    if (loop_->isInLoopThread())
+        throw UsageError(
+            "commitSync() would block the transaction's own event loop");
+    std::promise<std::exception_ptr> promise;
+    auto future = promise.get_future();
+    commitAsyncImpl([&promise](const std::exception_ptr &exception) {
+        promise.set_value(exception);
+    });
+    if (auto exception = future.get())
+        std::rethrow_exception(exception);
+}
+
+void TransactionImpl::commitAsyncImpl(
+    std::function<void(const std::exception_ptr &)> &&callback)
+{
+    auto thisPtr = shared_from_this();
+    loop_->runInLoop([thisPtr, callback = std::move(callback)]() mutable {
+        if (thisPtr->isCommitOrRollbackRequested_ ||
+            thisPtr->isCommitedOrRolledback_)
+        {
+            // A rollback request without a pending commit means the
+            // transaction is (being) rolled back; anything else is a second
+            // commit request.
+            auto exception =
+                thisPtr->isRolledBack_
+                    ? std::make_exception_ptr(TransactionRollback(
+                          "The transaction has been rolled back"))
+                    : std::make_exception_ptr(
+                          UsageError("Commit was already requested"));
+            if (callback)
+                callback(exception);
+            return;
+        }
+
+        thisPtr->isCommitOrRollbackRequested_ = true;
+        thisPtr->explicitCommitCallback_ = std::move(callback);
+        auto cmdPtr = std::make_shared<SqlCmd>();
+        cmdPtr->sql_ = "commit";
+        cmdPtr->parametersNumber_ = 0;
+        cmdPtr->callback_ = [thisPtr](const Result &) {
+            LOG_TRACE << "Transaction committed!";
+            thisPtr->isCommitedOrRolledback_ = true;
+            thisPtr->finishCommit(nullptr);
+        };
+        cmdPtr->exceptionCallback_ = [thisPtr](const std::exception_ptr &ePtr) {
+            try
+            {
+                std::rethrow_exception(ePtr);
+            }
+            catch (const DrogonDbException &e)
+            {
+                LOG_ERROR << "Transaction submission failed:"
+                          << e.base().what();
+            }
+            thisPtr->isCommitedOrRolledback_ = true;
+#if USE_SQLITE3
+            if (thisPtr->type_ == ClientType::Sqlite3)
+            {
+                // The connection is released once the failed commit has been
+                // rolled back, not when the failed command becomes idle.
+                auto usedUpCallback = std::move(thisPtr->usedUpCallback_);
+                thisPtr->usedUpCallback_ = std::function<void()>();
+                rollbackFailedSqliteCommit(thisPtr->connectionPtr_,
+                                           usedUpCallback,
+                                           [thisPtr, ePtr](bool) {
+                                               thisPtr->finishCommit(ePtr);
+                                           });
+                return;
+            }
+#endif
+            thisPtr->finishCommit(ePtr);
+        };
+        cmdPtr->isCommitCmd_ = true;
+        cmdPtr->thisPtr_ = thisPtr;
+        thisPtr->sqlCmdBuffer_.push_back(std::move(cmdPtr));
+
+        if (!thisPtr->isWorking_)
+        {
+            thisPtr->isWorking_ = true;
+            thisPtr->execNewTask();
+        }
+    });
+}
+
+bool TransactionImpl::cancelPendingCommit()
+{
+    // No SQL is accepted after a commit request, so a pending commit is always
+    // the last buffered command.
+    if (sqlCmdBuffer_.empty() || !sqlCmdBuffer_.back()->isCommitCmd_)
+        return false;
+    sqlCmdBuffer_.pop_back();
+    isRolledBack_ = true;
+    // The commit was never sent, so only the explicit commit callback is
+    // notified. It is deferred so that the failure which caused the
+    // cancellation is reported first.
+    if (explicitCommitCallback_)
+    {
+        loop_->queueInLoop([callback = std::move(explicitCommitCallback_)]() {
+            callback(std::make_exception_ptr(TransactionRollback(
+                "The transaction was rolled back before COMMIT was sent")));
+        });
+        explicitCommitCallback_ = nullptr;
+    }
+    return true;
+}
+
+void TransactionImpl::finishCommit(const std::exception_ptr &exception)
+{
+    if (commitCallback_)
+        commitCallback_(exception == nullptr);
+    if (explicitCommitCallback_)
+    {
+        auto callback = std::move(explicitCommitCallback_);
+        explicitCommitCallback_ = nullptr;
+        callback(exception);
+    }
+}
+
 void TransactionImpl::execNewTask()
 {
     loop_->assertInLoopThread();
@@ -285,7 +415,7 @@ void TransactionImpl::execNewTask()
                 std::move(cmd->formats_),
                 [callback = std::move(cmd->callback_), cmd, thisPtr](
                     const Result &r) {
-                    if (cmd->isRollbackCmd_)
+                    if (cmd->isRollbackCmd_ || cmd->isCommitCmd_)
                     {
                         thisPtr->isCommitedOrRolledback_ = true;
                     }
@@ -293,7 +423,7 @@ void TransactionImpl::execNewTask()
                         callback(r);
                 },
                 [cmd, thisPtr](const std::exception_ptr &ePtr) {
-                    if (!cmd->isRollbackCmd_)
+                    if (!cmd->isRollbackCmd_ && !cmd->isCommitCmd_)
                         thisPtr->rollback();
                     else
                     {
@@ -326,6 +456,7 @@ void TransactionImpl::releaseConnection()
 
 void TransactionImpl::failBufferedCommands(const std::exception_ptr &ePtr)
 {
+    cancelPendingCommit();
     std::list<SqlCmdPtr> pendingCmds;
     pendingCmds.swap(sqlCmdBuffer_);
     for (auto &cmd : pendingCmds)
@@ -386,6 +517,7 @@ void TransactionImpl::doBegin()
                               << e.what();
                 }
                 thisPtr->isCommitedOrRolledback_ = true;
+                thisPtr->isRolledBack_ = true;
                 thisPtr->isWorking_ = false;
                 thisPtr->thisPtr_.reset();
                 thisPtr->failBufferedCommands(std::make_exception_ptr(
