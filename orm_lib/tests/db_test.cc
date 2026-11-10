@@ -60,6 +60,9 @@ void expFunction(const DrogonDbException &e)
 }
 #if USE_POSTGRESQL
 DbClientPtr postgreClient;
+constexpr const char *postgreConnString =
+    "host=127.0.0.1 port=5432 dbname=postgres user=postgres password=12345 "
+    "client_encoding=utf8";
 
 DROGON_TEST(PostgreTest)
 {
@@ -1617,6 +1620,55 @@ DROGON_TEST(PostgreTest)
         catch (const DrogonDbException &e)
         {
             FAULT("postgresql - bounded prepared statement cache what():",
+                  e.base().what());
+        }
+    }
+
+    /// 10 Implicit commit while the connection deallocates an evicted statement
+    /// A transaction released without commit() commits from its destructor.
+    /// When its last statement's result evicts a cached prepared statement,
+    /// the connection is still busy with the DEALLOCATE as the result callback
+    /// releases the transaction; the COMMIT must wait for it, not be lost.
+    {
+        auto client = DbClient::newPgClient(postgreConnString, 1, false);
+        constexpr int distinctSqlCount = 300;
+        try
+        {
+            client->execSqlSync("drop table if exists implicit_commit_test");
+            client->execSqlSync("create table implicit_commit_test (id int)");
+            std::promise<bool> committed;
+            auto committedFuture = committed.get_future();
+            {
+                auto trans = client->newTransaction(
+                    [&committed](bool ok) { committed.set_value(ok); });
+                trans->execSqlAsync(
+                    "insert into implicit_commit_test values ($1)",
+                    [](const Result &) {},
+                    [](const DrogonDbException &) {},
+                    1);
+                for (int i = 0; i < distinctSqlCount; ++i)
+                {
+                    trans->execSqlAsync(
+                        "select $1::int + " + std::to_string(i) +
+                            " as implicit_commit",
+                        [](const Result &) {},
+                        [](const DrogonDbException &) {},
+                        i);
+                }
+                // The statements are still queued; the last reference goes
+                // away with the final result callback.
+            }
+            MANDATE(committedFuture.wait_for(std::chrono::seconds(10)) ==
+                    std::future_status::ready);
+            MANDATE(committedFuture.get());
+            auto r = client->execSqlSync(
+                "select count(*) from implicit_commit_test");
+            MANDATE(r[0][0].as<int64_t>() == 1);
+            client->execSqlSync("drop table implicit_commit_test");
+        }
+        catch (const DrogonDbException &e)
+        {
+            FAULT("postgresql - implicit commit after eviction what():",
                   e.base().what());
         }
     }
@@ -4756,11 +4808,7 @@ int main(int argc, char **argv)
         "host=127.0.0.1 port=3306 user=root client_encoding=utf8mb4", 1);
 #endif
 #if USE_POSTGRESQL
-    postgreClient = DbClient::newPgClient(
-        "host=127.0.0.1 port=5432 dbname=postgres user=postgres password=12345 "
-        "client_encoding=utf8",
-        1,
-        true);
+    postgreClient = DbClient::newPgClient(postgreConnString, 1, true);
 #endif
     const int testStatus = test::run(argc, argv);
     return testStatus;

@@ -71,6 +71,72 @@ void rollbackFailedSqliteCommit(const DbConnectionPtr &conn,
     });
 }
 #endif
+
+/// Sends the implicit COMMIT of a transaction that was released without an
+/// explicit commit or rollback, once its connection is idle.
+void commitOnIdleConnection(const DbConnectionPtr &conn,
+                            ClientType type,
+                            const std::function<void()> &ucb,
+                            const std::function<void(bool)> &commitCb)
+{
+    if (conn->isWorking())
+    {
+        // The last reference to a transaction can be released inside a result
+        // callback while the connection is still busy with its own follow-up
+        // command, such as the DEALLOCATE that evicts a cached prepared
+        // statement. COMMIT sent now would fail with "another command is
+        // already in progress" and the transaction's writes would be lost, so
+        // wait until the connection is idle. COMMIT is not sent from inside
+        // the idle callback because sending it replaces that callback while
+        // it runs.
+        auto loop = conn->loop();
+        conn->setIdleCallback([conn, type, ucb, commitCb, loop]() {
+            loop->queueInLoop([conn, type, ucb, commitCb]() {
+                commitOnIdleConnection(conn, type, ucb, commitCb);
+            });
+        });
+        return;
+    }
+    conn->setIdleCallback([ucb]() {
+        if (ucb)
+            ucb();
+    });
+    conn->execSql(
+        "commit",
+        0,
+        {},
+        {},
+        {},
+        [commitCb](const Result &) {
+            LOG_TRACE << "Transaction committed!";
+            if (commitCb)
+            {
+                commitCb(true);
+            }
+        },
+        [conn, type, ucb, commitCb](const std::exception_ptr &ePtr) {
+            try
+            {
+                std::rethrow_exception(ePtr);
+            }
+            catch (const DrogonDbException &e)
+            {
+                LOG_ERROR << "Transaction submission failed:"
+                          << e.base().what();
+#if USE_SQLITE3
+                if (type == ClientType::Sqlite3)
+                {
+                    rollbackFailedSqliteCommit(conn, ucb, commitCb);
+                    return;
+                }
+#endif
+                if (commitCb)
+                {
+                    commitCb(false);
+                }
+            }
+        });
+}
 }  // namespace
 
 TransactionImpl::TransactionImpl(ClientType type,
@@ -98,45 +164,7 @@ TransactionImpl::~TransactionImpl()
                            type = type_,
                            ucb = std::move(usedUpCallback_),
                            commitCb = std::move(commitCallback_)]() {
-            conn->setIdleCallback([ucb]() {
-                if (ucb)
-                    ucb();
-            });
-            conn->execSql(
-                "commit",
-                0,
-                {},
-                {},
-                {},
-                [commitCb](const Result &) {
-                    LOG_TRACE << "Transaction committed!";
-                    if (commitCb)
-                    {
-                        commitCb(true);
-                    }
-                },
-                [conn, type, ucb, commitCb](const std::exception_ptr &ePtr) {
-                    try
-                    {
-                        std::rethrow_exception(ePtr);
-                    }
-                    catch (const DrogonDbException &e)
-                    {
-                        LOG_ERROR << "Transaction submission failed:"
-                                  << e.base().what();
-#if USE_SQLITE3
-                        if (type == ClientType::Sqlite3)
-                        {
-                            rollbackFailedSqliteCommit(conn, ucb, commitCb);
-                            return;
-                        }
-#endif
-                        if (commitCb)
-                        {
-                            commitCb(false);
-                        }
-                    }
-                });
+            commitOnIdleConnection(conn, type, ucb, commitCb);
         });
     }
     else
